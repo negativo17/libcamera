@@ -1,0 +1,1079 @@
+From: negativo17 <build@negativo17.org>
+Date: Thu, 9 Jul 2026 00:00:00 +0000
+Subject: [PATCH] Add libcamhal pipeline handler for Intel IPU cameras
+
+Adds a "libcamhal" pipeline handler that exposes Intel IPU (IPU6/IPU7/IPU8)
+cameras through the proprietary libcamhal HAL, the same path icamerasrc uses,
+giving full Intel imaging (3A/tuning) instead of libcamera's software ISP.
+
+The HAL is dlopen()'d with RTLD_LOCAL rather than linked: linking it globally
+would interpose the platform plugin's logging globals and crash on the first
+HAL log (this is why icamerasrc, which loads the HAL locally, never crashes).
+
+libcamhal exists only on x86_64, so the pipeline is enabled there only. Both it
+and the software-ISP "simple" handler are built; to avoid a duplicate camera,
+"simple" calls camhal_available() (a dlopen-only check) and yields the Intel
+IPU media devices (intel-ipu6/intel-ipu7) to libcamhal when it is installed,
+gated on the HAVE_PIPELINE_LIBCAMHAL config.h define. If libcamhal is absent it
+falls through to the software ISP unchanged.
+
+Buffers are re-queued with their sequence/timestamp reset (as icamerasrc does),
+without which the HAL's bookkeeping is corrupted and ISYS stalls after the
+buffers cycle once.
+
+By default only camera 0 (the primary bound sensor) is registered, since the
+HAL enumerates every configured sensor slot regardless of presence; set
+LIBCAMERA_CAMHAL_CAMERAS=all (or an id) to override.
+diff --git a/meson.build b/meson.build
+index e86a4f7..5ba450b 100644
+--- a/meson.build
++++ b/meson.build
+@@ -217,6 +217,9 @@ arch_x86 = ['x86', 'x86_64']
+ pipelines_support = {
+     'imx8-isi':     arch_arm,
+     'ipu3':         arch_x86,
++    # libcamhal (the proprietary Intel IPU HAL) is only available on x86_64, so
++    # restrict to it rather than arch_x86 (which would include i686).
++    'libcamhal':    ['x86_64'],
+     'mali-c55':     arch_arm,
+     'rkisp1':       arch_arm,
+     #'rpi/pisp':     arch_arm,
+@@ -252,6 +255,13 @@ if get_option('test')
+     endforeach
+ endif
+ 
++# When the libcamhal pipeline handler is built, let the "simple" handler detect
++# libcamhal at runtime and yield Intel IPU devices to it (so the software-ISP
++# duplicate does not appear alongside the HAL camera).
++if pipelines.contains('libcamhal')
++    config_h.set('HAVE_PIPELINE_LIBCAMHAL', 1)
++endif
++
+ # Utilities are parsed first to provide support for other components.
+ subdir('utils')
+ 
+diff --git a/meson_options.txt b/meson_options.txt
+index 20baacc..b32c12f 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -80,6 +80,7 @@ option('pipelines',
+             'auto',
+             'imx8-isi',
+             'ipu3',
++            'libcamhal',
+             'mali-c55',
+             'rkisp1',
+             'rpi/pisp',
+diff --git a/src/libcamera/pipeline/libcamhal/camhal_wrapper.cpp b/src/libcamera/pipeline/libcamhal/camhal_wrapper.cpp
+new file mode 100644
+index 0000000..9783fab
+--- /dev/null
++++ b/src/libcamera/pipeline/libcamhal/camhal_wrapper.cpp
+@@ -0,0 +1,350 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * C façade over libcamhal -- see camhal_wrapper.h for why the HAL is dlopen'd
++ * with RTLD_LOCAL rather than linked.
++ */
++#include "camhal_wrapper.h"
++
++#include <libcamhal/api/ICamera.h>   /* types only; functions are dlsym'd */
++
++#include <linux/videodev2.h>
++
++#include <dlfcn.h>
++
++#include <cstdio>
++#include <cstring>
++#include <cstdlib>
++#include <mutex>
++#include <vector>
++
++using namespace icamera;
++
++namespace {
++
++std::mutex g_lock;
++void      *g_hal = nullptr;
++int        g_init_refs = 0;
++
++int  (*p_get_number_of_cameras)();
++int  (*p_get_camera_info)(int, camera_info_t &);
++int  (*p_camera_hal_init)();
++int  (*p_camera_hal_deinit)();
++int  (*p_camera_device_open)(int, int);
++void (*p_camera_device_close)(int);
++int  (*p_camera_device_config_streams)(int, stream_config_t *);
++int  (*p_camera_device_start)(int);
++int  (*p_camera_device_stop)(int);
++int  (*p_camera_stream_qbuf)(int, camera_buffer_t **, int, const Parameters *);
++int  (*p_camera_stream_dqbuf)(int, int, camera_buffer_t **, Parameters *);
++/*
++ * Parameters::getSupportedStreamConfig() is a non-virtual C++ method, so it
++ * cannot be reached through a vtable and calling it directly would force us to
++ * link libcamhal. We dlsym its mangled symbol and call it with the object
++ * pointer passed explicitly as the (const) `this` argument.
++ */
++int  (*p_getSupportedStreamConfig)(const Parameters *, stream_array_t &);
++constexpr char kGetSupportedStreamConfigSym[] =
++	"_ZNK7icamera10Parameters24getSupportedStreamConfigERSt6vectorINS_8stream_tESaIS2_EE";
++
++bool load_hal()   /* call with g_lock held */
++{
++	if (g_hal)
++		return true;
++	void *h = dlopen("libcamhal.so.0", RTLD_NOW | RTLD_LOCAL);
++	if (!h) {
++		fprintf(stderr, "camhal: dlopen libcamhal.so.0: %s\n", dlerror());
++		return false;
++	}
++#define LOAD_SYM(sym)                                                      \
++	p_##sym = (decltype(p_##sym))dlsym(h, #sym);                       \
++	if (!p_##sym) {                                                     \
++		fprintf(stderr, "camhal: missing symbol %s\n", #sym);      \
++		dlclose(h);                                                \
++		return false;                                              \
++	}
++	LOAD_SYM(get_number_of_cameras)
++	LOAD_SYM(get_camera_info)
++	LOAD_SYM(camera_hal_init)
++	LOAD_SYM(camera_hal_deinit)
++	LOAD_SYM(camera_device_open)
++	LOAD_SYM(camera_device_close)
++	LOAD_SYM(camera_device_config_streams)
++	LOAD_SYM(camera_device_start)
++	LOAD_SYM(camera_device_stop)
++	LOAD_SYM(camera_stream_qbuf)
++	LOAD_SYM(camera_stream_dqbuf)
++#undef LOAD_SYM
++	p_getSupportedStreamConfig =
++		(decltype(p_getSupportedStreamConfig))dlsym(h, kGetSupportedStreamConfigSym);
++	if (!p_getSupportedStreamConfig) {
++		fprintf(stderr, "camhal: missing symbol getSupportedStreamConfig\n");
++		dlclose(h);
++		return false;
++	}
++	g_hal = h;
++	return true;
++}
++
++int hal_ref()
++{
++	std::lock_guard<std::mutex> guard(g_lock);
++	if (!load_hal())
++		return -1;
++	if (g_init_refs == 0) {
++		p_get_number_of_cameras();   /* mirror icamerasrc: enumerate first */
++		int ret = p_camera_hal_init();
++		if (ret != 0)
++			return ret;
++	}
++	g_init_refs++;
++	return 0;
++}
++
++void hal_unref()
++{
++	std::lock_guard<std::mutex> guard(g_lock);
++	if (g_init_refs > 0 && --g_init_refs == 0)
++		p_camera_hal_deinit();
++}
++
++void copy_str(char *dst, size_t cap, const char *src)
++{
++	if (!src) { dst[0] = '\0'; return; }
++	std::strncpy(dst, src, cap - 1);
++	dst[cap - 1] = '\0';
++}
++
++} /* namespace */
++
++int camhal_probe(struct camhal_camera_info out[CAMHAL_MAX_CAMERAS])
++{
++	/*
++	 * camera_hal_init() runs the media-graph enumeration that filters the
++	 * statically-configured sensor list down to the ones actually present.
++	 * Without it, get_number_of_cameras() returns every sensor the HAL has
++	 * a config for. We init, read the info + supported stream configs, then
++	 * deinit (a later capture re-inits before opening the device).
++	 */
++	if (hal_ref() != 0)
++		return -1;
++
++	int count = 0;
++	{
++		std::lock_guard<std::mutex> guard(g_lock);
++		int n = p_get_number_of_cameras();
++		for (int i = 0; i < n && count < CAMHAL_MAX_CAMERAS; i++) {
++			camera_info_t info{};
++			if (p_get_camera_info(i, info) != 0)
++				continue;
++
++			camhal_camera_info &o = out[count];
++			o.id          = i;
++			o.facing      = info.facing;
++			o.orientation = info.orientation;
++			copy_str(o.name, sizeof(o.name), info.name);
++			copy_str(o.description, sizeof(o.description), info.description);
++
++			o.nres = 0;
++			if (info.capability) {
++				stream_array_t configs;
++				p_getSupportedStreamConfig(info.capability, configs);
++				for (const auto &c : configs) {
++					if (c.format != V4L2_PIX_FMT_NV12)
++						continue;
++					bool dup = false;
++					for (int k = 0; k < o.nres; k++)
++						if (o.res[k].width == c.width &&
++						    o.res[k].height == c.height) {
++							dup = true;
++							break;
++						}
++					if (dup || o.nres >= CAMHAL_MAX_RES)
++						continue;
++					o.res[o.nres].width  = c.width;
++					o.res[o.nres].height = c.height;
++					o.nres++;
++				}
++			}
++			count++;
++		}
++	}
++
++	hal_unref();
++	return count;
++}
++
++int camhal_available(void)
++{
++	std::lock_guard<std::mutex> guard(g_lock);
++	/*
++	 * Detection is dlopen-only on purpose: we must NOT call any HAL entry
++	 * point here. "simple" calls this during device enumeration, before the
++	 * libcamhal handler brings the HAL up with camera_hal_init(). Calling
++	 * e.g. get_number_of_cameras() out of that order corrupts the HAL's
++	 * internal state and streaming dies after the first few frames. A
++	 * successful dlopen means libcamhal is installed; that is all we need to
++	 * decide whether to yield the Intel IPU device to it. "simple" only
++	 * reaches that device when the IPU hardware is actually present.
++	 */
++	return load_hal() ? 1 : 0;
++}
++
++struct camhal_capture {
++	int                          id = -1;
++	int                          stream_id = 0;
++	std::vector<camera_buffer_t> bufs;
++	bool                         started = false;
++};
++
++camhal_capture *camhal_capture_start(int camera_id, int width, int height,
++				     int nbuf, uint32_t *stride, uint32_t *size)
++{
++	/* Fixed NV12 output stream. field must be 0 (ANY) -- V4L2_FIELD_NONE is
++	 * rejected by config_streams (-38); USERPTR buffers -- MMAP allocation
++	 * returns -1 here. */
++	stream_t s{};
++	s.format     = V4L2_PIX_FMT_NV12;
++	s.width      = width;
++	s.height     = height;
++	s.field      = 0;
++	s.memType    = V4L2_MEMORY_USERPTR;
++	s.streamType = CAMERA_STREAM_OUTPUT;
++	s.usage      = CAMERA_STREAM_PREVIEW;   /* icamerasrc's default src_stream_usage */
++
++	if (hal_ref() != 0)
++		return nullptr;
++
++	int ret = p_camera_device_open(camera_id, 0);
++	if (ret != 0) {
++		fprintf(stderr, "camhal: camera_device_open(%d) failed: %d\n", camera_id, ret);
++		hal_unref();
++		return nullptr;
++	}
++
++	stream_config_t cfg{};
++	cfg.num_streams    = 1;
++	cfg.streams        = &s;
++	cfg.operation_mode = CAMERA_STREAM_CONFIGURATION_MODE_AUTO;
++
++	ret = p_camera_device_config_streams(camera_id, &cfg);
++	if (ret != 0) {
++		fprintf(stderr, "camhal: config_streams(%dx%d NV12) failed: %d\n",
++			width, height, ret);
++		p_camera_device_close(camera_id);
++		hal_unref();
++		return nullptr;
++	}
++
++	/* config_streams may leave stride/size unset; compute NV12 geometry. */
++	if (s.stride <= 0)
++		s.stride = width;
++	if (s.size <= 0)
++		s.size = s.stride * height * 3 / 2;
++
++	auto *c = new camhal_capture();
++	c->id        = camera_id;
++	c->stream_id = s.id;
++	c->bufs.resize(nbuf);
++
++	for (int i = 0; i < nbuf; i++) {
++		camera_buffer_t &b = c->bufs[i];
++		std::memset(&b, 0, sizeof(b));
++		b.s         = s;
++		b.s.memType = V4L2_MEMORY_USERPTR;
++		b.flags     = 0;   /* icamerasrc default (BUFFER_USAGE_NONE) */
++		void *mem   = nullptr;
++		if (posix_memalign(&mem, 4096, s.size) != 0 || mem == nullptr) {
++			fprintf(stderr, "camhal: posix_memalign[%d] (%d bytes) failed\n", i, s.size);
++			p_camera_device_close(camera_id);
++			delete c;
++			hal_unref();
++			return nullptr;
++		}
++		b.addr = mem;
++	}
++
++	for (int i = 0; i < nbuf; i++) {
++		camera_buffer_t *p = &c->bufs[i];
++		ret = p_camera_stream_qbuf(camera_id, &p, 1, nullptr);
++		if (ret != 0) {
++			fprintf(stderr, "camhal: initial qbuf[%d] failed: %d\n", i, ret);
++			p_camera_device_close(camera_id);
++			for (camera_buffer_t &bb : c->bufs)
++				free(bb.addr);
++			delete c;
++			hal_unref();
++			return nullptr;
++		}
++	}
++
++	ret = p_camera_device_start(camera_id);
++	if (ret != 0) {
++		fprintf(stderr, "camhal: camera_device_start failed: %d\n", ret);
++		p_camera_device_close(camera_id);
++		for (camera_buffer_t &bb : c->bufs)
++			free(bb.addr);
++		delete c;
++		hal_unref();
++		return nullptr;
++	}
++	c->started = true;
++
++	if (stride) *stride = (uint32_t)s.stride;
++	if (size)   *size   = (uint32_t)s.size;
++	fprintf(stderr, "camhal: streaming cam %d %dx%d NV12 stride=%d size=%d nbuf=%d\n",
++		camera_id, width, height, s.stride, s.size, nbuf);
++	return c;
++}
++
++int camhal_capture_wait(camhal_capture *c, void **addr, uint32_t *size,
++			uint32_t *stride, uint64_t *timestamp_ns, void **cookie)
++{
++	if (!c || !c->started)
++		return -1;
++	camera_buffer_t *p = nullptr;
++	int ret = p_camera_stream_dqbuf(c->id, c->stream_id, &p, nullptr);
++	if (ret != 0 || !p)
++		return -1;
++	if (addr)         *addr         = p->addr;
++	if (size)         *size         = (uint32_t)p->s.size;
++	if (stride)       *stride       = (uint32_t)p->s.stride;
++	if (timestamp_ns) *timestamp_ns = p->timestamp;
++	if (cookie)       *cookie       = p;
++	return 0;
++}
++
++void camhal_capture_requeue(camhal_capture *c, void *cookie)
++{
++	if (!c || !cookie || !c->started)
++		return;
++	camera_buffer_t *p = (camera_buffer_t *)cookie;
++	/*
++	 * Reset the per-buffer sequence/timestamp before re-queuing, exactly as
++	 * icamerasrc does (gstcamerasrcbufferpool.cpp release_buffer). dqbuf
++	 * fills these with the captured frame's values; re-queuing a capture
++	 * buffer while they still hold the previous frame's values confuses the
++	 * HAL's buffer bookkeeping and ISYS stalls after the buffers cycle once.
++	 */
++	p->sequence  = -1;
++	p->timestamp = 0;
++	p_camera_stream_qbuf(c->id, &p, 1, nullptr);
++}
++
++void camhal_capture_stop_streaming(camhal_capture *c)
++{
++	if (!c || !c->started)
++		return;
++	c->started = false;       /* makes an in-flight wait() return -1 */
++	p_camera_device_stop(c->id);
++}
++
++void camhal_capture_close(camhal_capture *c)
++{
++	if (!c)
++		return;
++	p_camera_device_close(c->id);
++	for (camera_buffer_t &b : c->bufs)
++		free(b.addr);
++	delete c;
++	hal_unref();
++}
+diff --git a/src/libcamera/pipeline/libcamhal/camhal_wrapper.h b/src/libcamera/pipeline/libcamhal/camhal_wrapper.h
+new file mode 100644
+index 0000000..252abfa
+--- /dev/null
++++ b/src/libcamera/pipeline/libcamhal/camhal_wrapper.h
+@@ -0,0 +1,94 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * C façade over the Intel IPU camera HAL (libcamhal, a C++ library).
++ *
++ * All libcamhal calls live behind this façade so the C++/dlopen details are
++ * contained to camhal_wrapper.cpp and the pipeline handler stays readable.
++ *
++ * The HAL is loaded with dlopen(RTLD_LOCAL) rather than linked: linking it
++ * globally (DT_NEEDED) puts its symbols in the global scope where they
++ * interpose the platform plugin's (ipu6ep.so) identically-named logging
++ * globals, and the plugin then crashes on its first log. GStreamer's icamerasrc
++ * loads the HAL with local scope, which is why it never crashes; we mirror it.
++ *
++ * The HAL is single-owner per camera: only one process may drive a given camera
++ * at a time (do not run icamerasrc / v4l2-relayd against the same camera).
++ */
++#pragma once
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define CAMHAL_MAX_CAMERAS 8
++#define CAMHAL_MAX_RES     32
++
++struct camhal_resolution {
++	int width;
++	int height;
++};
++
++/* Snapshot of one camera as reported by libcamhal. Strings are copied so they
++ * stay valid after the HAL handle is released. */
++struct camhal_camera_info {
++	int  id;
++	int  facing;        /* HAL facing: back/world vs front/user */
++	int  orientation;
++	char name[64];      /* sensor name, e.g. "ov02c10-uf" */
++	char description[128];
++	int  nres;          /* number of supported NV12 resolutions below */
++	struct camhal_resolution res[CAMHAL_MAX_RES];
++};
++
++/*
++ * Probe cameras and their supported NV12 resolutions. Mirrors icamerasrc's caps
++ * path: dlopen + get_number_of_cameras + get_camera_info +
++ * capability->getSupportedStreamConfig, with NO camera_hal_init and no device
++ * open (that ordering is what icamerasrc uses and what avoids wedging a later
++ * open). Fills up to CAMHAL_MAX_CAMERAS; returns the count (>=0) or negative on
++ * failure.
++ */
++int camhal_probe(struct camhal_camera_info out[CAMHAL_MAX_CAMERAS]);
++
++/*
++ * Lightweight "is the HAL usable" check for other pipeline handlers (e.g.
++ * "simple") to decide whether to yield Intel IPU devices to libcamhal. Returns
++ * 1 if libcamhal can be dlopen'd and reports at least one camera, else 0. Does
++ * NOT camera_hal_init() or open any device, so it is cheap to call during
++ * enumeration.
++ */
++int camhal_available(void);
++
++/* ---- capture --------------------------------------------------------------
++ * A capture opens one camera, configures a single NV12 output stream, allocates
++ * `nbuf` USERPTR buffers and starts streaming.
++ */
++typedef struct camhal_capture camhal_capture;
++
++/* Returns a handle or NULL. On success stride/size report the HAL buffer
++ * geometry (stride = aligned bytes-per-line; size = NV12 buffer size). */
++camhal_capture *camhal_capture_start(int camera_id, int width, int height,
++				     int nbuf, uint32_t *stride, uint32_t *size);
++
++/* Block until the next frame is ready. Fills the frame pointer/geometry and an
++ * opaque cookie used to return the buffer. Returns 0 or negative on error
++ * (including after camhal_capture_stop_streaming() has been called). */
++int  camhal_capture_wait(camhal_capture *c, void **addr, uint32_t *size,
++			 uint32_t *stride, uint64_t *timestamp_ns, void **cookie);
++
++/* Return a frame from camhal_capture_wait() back to the HAL for reuse. */
++void camhal_capture_requeue(camhal_capture *c, void *cookie);
++
++/* Stop the sensor streaming only. This unblocks a thread parked in
++ * camhal_capture_wait() so it can be joined before camhal_capture_close(). */
++void camhal_capture_stop_streaming(camhal_capture *c);
++
++/* Close the camera and free all resources. Call only after the capture thread
++ * has been joined (buffers are freed here). */
++void camhal_capture_close(camhal_capture *c);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/libcamera/pipeline/libcamhal/libcamhal.cpp b/src/libcamera/pipeline/libcamhal/libcamhal.cpp
+new file mode 100644
+index 0000000..3df48e6
+--- /dev/null
++++ b/src/libcamera/pipeline/libcamhal/libcamhal.cpp
+@@ -0,0 +1,491 @@
++/* SPDX-License-Identifier: LGPL-2.1-or-later */
++/*
++ * Copyright (C) 2026
++ *
++ * Pipeline handler for Intel IPU cameras via the proprietary libcamhal HAL.
++ *
++ * Unlike the "simple" pipeline handler (which drives the IPU ISYS raw stream
++ * through libcamera's software ISP), this handler delegates the whole capture
++ * path -- ISYS, PSYS, 3A and Intel's imaging -- to libcamhal, exactly as the
++ * icamerasrc GStreamer element does. libcamhal owns the V4L2/media devices, so
++ * this handler enumerates and drives cameras entirely through the HAL API and
++ * never touches the media graph itself.
++ *
++ * The HAL is reached through camhal_wrapper.{h,cpp}, which dlopen()s it with
++ * RTLD_LOCAL (see there for why). Frames are copied from the HAL's USERPTR
++ * buffers into the application's libcamera FrameBuffers by a dedicated capture
++ * thread.
++ */
++
++#include <atomic>
++#include <cstdlib>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <queue>
++#include <set>
++#include <string>
++#include <string.h>
++#include <unistd.h>
++#include <vector>
++
++#include <libcamera/base/log.h>
++#include <libcamera/base/thread.h>
++#include <libcamera/base/utils.h>
++
++#include <libcamera/control_ids.h>
++#include <libcamera/controls.h>
++#include <libcamera/formats.h>
++#include <libcamera/geometry.h>
++#include <libcamera/pixel_format.h>
++#include <libcamera/property_ids.h>
++#include <libcamera/stream.h>
++
++#include "libcamera/internal/camera.h"
++#include "libcamera/internal/dma_buf_allocator.h"
++#include "libcamera/internal/formats.h"
++#include "libcamera/internal/framebuffer.h"
++#include "libcamera/internal/mapped_framebuffer.h"
++#include "libcamera/internal/pipeline_handler.h"
++#include "libcamera/internal/request.h"
++
++#include "camhal_wrapper.h"
++
++namespace libcamera {
++
++LOG_DEFINE_CATEGORY(Libcamhal)
++
++class LibcamhalCameraData : public Camera::Private, public Thread
++{
++public:
++	static constexpr unsigned int kBufferCount = 6;
++
++	LibcamhalCameraData(PipelineHandler *pipe, const camhal_camera_info &info)
++		: Camera::Private(pipe), halId_(info.id)
++	{
++		for (int i = 0; i < info.nres; i++) {
++			Size s(info.res[i].width, info.res[i].height);
++			resolutions_.push_back(s);
++			if (s.width * s.height > maxSize_.width * maxSize_.height)
++				maxSize_ = s;
++			if (minSize_.isNull() ||
++			    s.width * s.height < minSize_.width * minSize_.height)
++				minSize_ = s;
++		}
++
++		properties_.set(properties::PixelArrayActiveAreas,
++				{ Rectangle(maxSize_) });
++		properties_.set(properties::Location,
++				info.facing == 1 ? properties::CameraLocationFront
++						 : properties::CameraLocationBack);
++		properties_.set(properties::Model, std::string(info.name));
++	}
++
++	/* Capture-thread entry point (overrides Thread::run()). */
++	void run() override;
++
++	void fillBuffer(FrameBuffer *buffer, const void *addr, uint32_t halStride);
++
++	int halId_;
++	Stream stream_;
++	std::vector<Size> resolutions_;
++	Size maxSize_;
++	Size minSize_;
++
++	/* Capture state, owned by the pipeline handler thread. */
++	camhal_capture *cap_ = nullptr;
++	uint32_t halStride_ = 0;
++	uint32_t halSize_ = 0;
++
++	/* Request hand-off from the pipeline thread to the capture thread. */
++	std::mutex mutex_;
++	std::queue<Request *> pending_;
++	std::atomic<bool> running_{ false };
++	unsigned int seq_ = 0;
++
++	Signal<FrameBuffer *> bufferCompleted;
++};
++
++class LibcamhalCameraConfiguration : public CameraConfiguration
++{
++public:
++	LibcamhalCameraConfiguration(LibcamhalCameraData *data)
++		: CameraConfiguration(), data_(data)
++	{
++	}
++
++	Status validate() override;
++
++private:
++	const LibcamhalCameraData *data_;
++};
++
++class PipelineHandlerLibcamhal : public PipelineHandler
++{
++public:
++	PipelineHandlerLibcamhal(CameraManager *manager);
++
++	std::unique_ptr<CameraConfiguration>
++	generateConfiguration(Camera *camera, Span<const StreamRole> roles) override;
++	int configure(Camera *camera, CameraConfiguration *config) override;
++
++	int exportFrameBuffers(Camera *camera, Stream *stream,
++			       std::vector<std::unique_ptr<FrameBuffer>> *buffers) override;
++
++	int start(Camera *camera, const ControlList *controls) override;
++	void stopDevice(Camera *camera) override;
++
++	int queueRequestDevice(Camera *camera, Request *request) override;
++
++	bool match(DeviceEnumerator *enumerator) override;
++
++private:
++	LibcamhalCameraData *cameraData(Camera *camera)
++	{
++		return static_cast<LibcamhalCameraData *>(camera->_d());
++	}
++
++	void bufferCompleted(FrameBuffer *buffer);
++
++	DmaBufAllocator dmaBufAllocator_;
++	static bool created_;
++};
++
++bool PipelineHandlerLibcamhal::created_ = false;
++
++/* -------------------------------------------------------------------------- */
++
++CameraConfiguration::Status LibcamhalCameraConfiguration::validate()
++{
++	Status status = Valid;
++
++	if (config_.empty())
++		return Invalid;
++
++	if (config_.size() > 1) {
++		config_.resize(1);
++		status = Adjusted;
++	}
++
++	StreamConfiguration &cfg = config_[0];
++
++	if (cfg.pixelFormat != formats::NV12) {
++		cfg.pixelFormat = formats::NV12;
++		status = Adjusted;
++	}
++
++	/* Snap the requested size to the closest supported one by area. */
++	bool found = false;
++	for (const Size &s : data_->resolutions_) {
++		if (s == cfg.size) {
++			found = true;
++			break;
++		}
++	}
++	if (!found) {
++		Size best = data_->maxSize_;
++		uint64_t bestDelta = UINT64_MAX;
++		for (const Size &s : data_->resolutions_) {
++			int64_t dw = (int64_t)s.width - cfg.size.width;
++			int64_t dh = (int64_t)s.height - cfg.size.height;
++			uint64_t d = (uint64_t)(dw * dw + dh * dh);
++			if (d < bestDelta) {
++				bestDelta = d;
++				best = s;
++			}
++		}
++		cfg.size = best;
++		status = Adjusted;
++	}
++
++	if (cfg.colorSpace != ColorSpace::Rec709) {
++		cfg.colorSpace = ColorSpace::Rec709;
++		status = Adjusted;
++	}
++	if (validateColorSpaces() == Adjusted)
++		status = Adjusted;
++
++	const PixelFormatInfo &info = PixelFormatInfo::info(cfg.pixelFormat);
++	cfg.stride = info.stride(cfg.size.width, 0, 1);
++	cfg.frameSize = info.frameSize(cfg.size, 1);
++	cfg.bufferCount = LibcamhalCameraData::kBufferCount;
++
++	return status;
++}
++
++/* -------------------------------------------------------------------------- */
++
++PipelineHandlerLibcamhal::PipelineHandlerLibcamhal(CameraManager *manager)
++	: PipelineHandler(manager),
++	  dmaBufAllocator_(DmaBufAllocator::DmaBufAllocatorFlag::CmaHeap |
++			   DmaBufAllocator::DmaBufAllocatorFlag::SystemHeap |
++			   DmaBufAllocator::DmaBufAllocatorFlag::UDmaBuf)
++{
++}
++
++std::unique_ptr<CameraConfiguration>
++PipelineHandlerLibcamhal::generateConfiguration(Camera *camera,
++						Span<const StreamRole> roles)
++{
++	LibcamhalCameraData *data = cameraData(camera);
++	auto config = std::make_unique<LibcamhalCameraConfiguration>(data);
++
++	if (roles.empty())
++		return config;
++
++	if (roles.size() > 1) {
++		LOG(Libcamhal, Error) << "Only a single stream is supported";
++		return {};
++	}
++
++	std::map<PixelFormat, std::vector<SizeRange>> streamFormats;
++	streamFormats[formats::NV12] = { { data->minSize_, data->maxSize_ } };
++	StreamFormats formats(streamFormats);
++	StreamConfiguration cfg(formats);
++	cfg.pixelFormat = formats::NV12;
++	cfg.size = data->maxSize_;
++	cfg.bufferCount = LibcamhalCameraData::kBufferCount;
++	cfg.colorSpace = ColorSpace::Rec709;
++
++	config->addConfiguration(cfg);
++	config->validate();
++
++	return config;
++}
++
++int PipelineHandlerLibcamhal::configure(Camera *camera,
++					CameraConfiguration *config)
++{
++	LibcamhalCameraData *data = cameraData(camera);
++	StreamConfiguration &cfg = config->at(0);
++	cfg.setStream(&data->stream_);
++	return 0;
++}
++
++int PipelineHandlerLibcamhal::exportFrameBuffers(
++	[[maybe_unused]] Camera *camera, Stream *stream,
++	std::vector<std::unique_ptr<FrameBuffer>> *buffers)
++{
++	if (!dmaBufAllocator_.isValid())
++		return -ENOBUFS;
++
++	const StreamConfiguration &config = stream->configuration();
++	const PixelFormatInfo &info = PixelFormatInfo::info(config.pixelFormat);
++
++	std::vector<unsigned int> planeSizes;
++	for (size_t i = 0; i < info.numPlanes(); ++i)
++		planeSizes.push_back(info.planeSize(config.size, i));
++
++	return dmaBufAllocator_.exportBuffers(config.bufferCount, planeSizes, buffers);
++}
++
++int PipelineHandlerLibcamhal::start(Camera *camera,
++				    [[maybe_unused]] const ControlList *controls)
++{
++	LibcamhalCameraData *data = cameraData(camera);
++	const StreamConfiguration &cfg = data->stream_.configuration();
++
++	data->cap_ = camhal_capture_start(data->halId_, cfg.size.width,
++					  cfg.size.height, LibcamhalCameraData::kBufferCount,
++					  &data->halStride_, &data->halSize_);
++	if (!data->cap_) {
++		LOG(Libcamhal, Error) << "Failed to start libcamhal capture";
++		return -ENODEV;
++	}
++
++	data->seq_ = 0;
++	data->running_ = true;
++	data->bufferCompleted.connect(this, &PipelineHandlerLibcamhal::bufferCompleted,
++				      ConnectionTypeQueued);
++	data->start();		/* runs LibcamhalCameraData::run() */
++
++	return 0;
++}
++
++void PipelineHandlerLibcamhal::stopDevice(Camera *camera)
++{
++	LibcamhalCameraData *data = cameraData(camera);
++
++	data->running_ = false;
++	/* Unblock the capture thread parked in camhal_capture_wait(). */
++	camhal_capture_stop_streaming(data->cap_);
++	data->wait();		/* join the capture thread */
++
++	/* Flush any queued bufferCompleted signals to this thread. */
++	thread()->dispatchMessages(Message::Type::InvokeMessage, this);
++	data->bufferCompleted.disconnect(this);
++
++	camhal_capture_close(data->cap_);
++	data->cap_ = nullptr;
++
++	/* Cancel any requests that never received a frame. */
++	std::lock_guard<std::mutex> lock(data->mutex_);
++	while (!data->pending_.empty()) {
++		cancelRequest(data->pending_.front());
++		data->pending_.pop();
++	}
++}
++
++int PipelineHandlerLibcamhal::queueRequestDevice([[maybe_unused]] Camera *camera,
++						 Request *request)
++{
++	LibcamhalCameraData *data = cameraData(camera);
++
++	std::lock_guard<std::mutex> lock(data->mutex_);
++	data->pending_.push(request);
++
++	return 0;
++}
++
++bool PipelineHandlerLibcamhal::match([[maybe_unused]] DeviceEnumerator *enumerator)
++{
++	if (created_)
++		return false;
++	created_ = true;
++
++	camhal_camera_info infos[CAMHAL_MAX_CAMERAS];
++	int n = camhal_probe(infos);
++	if (n <= 0) {
++		LOG(Libcamhal, Debug) << "No libcamhal cameras found";
++		return false;
++	}
++
++	/*
++	 * libcamhal enumerates every sensor slot its platform profile defines
++	 * (e.g. multiple ov02c10 ports plus ar0234 USB bridges), not just the
++	 * ones physically present -- it has no presence flag we can read here.
++	 * icamerasrc simply drives camera 0, the primary bound sensor, so we do
++	 * the same by default. Set LIBCAMERA_CAMHAL_CAMERAS=all to expose every
++	 * enumerated slot (most will fail to stream), or to a specific id.
++	 */
++	const char *sel = getenv("LIBCAMERA_CAMHAL_CAMERAS");
++	bool exposeAll = sel && !strcmp(sel, "all");
++	int wantId = (sel && !exposeAll) ? atoi(sel) : 0;
++
++	bool registered = false;
++	std::set<std::string> ids;
++	for (int i = 0; i < n; i++) {
++		if (!exposeAll && infos[i].id != wantId)
++			continue;
++		if (infos[i].nres == 0) {
++			LOG(Libcamhal, Warning)
++				<< "Camera " << infos[i].name
++				<< " reports no NV12 resolutions, skipping";
++			continue;
++		}
++
++		std::string id = std::string(infos[i].name) + "-hal" +
++				 std::to_string(infos[i].id);
++		if (!ids.insert(id).second) {
++			LOG(Libcamhal, Warning)
++				<< "Duplicate camera id " << id << ", skipping";
++			continue;
++		}
++
++		auto data = std::make_unique<LibcamhalCameraData>(this, infos[i]);
++		std::set<Stream *> streams{ &data->stream_ };
++		std::shared_ptr<Camera> camera =
++			Camera::create(std::move(data), id, streams);
++
++		registerCamera(std::move(camera));
++		LOG(Libcamhal, Info) << "Registered libcamhal camera " << id;
++		registered = true;
++	}
++
++	return registered;
++}
++
++void PipelineHandlerLibcamhal::bufferCompleted(FrameBuffer *buffer)
++{
++	Request *request = buffer->request();
++	if (completeBuffer(request, buffer))
++		completeRequest(request);
++}
++
++/* -------------------------------------------------------------------------- */
++
++void LibcamhalCameraData::fillBuffer(FrameBuffer *buffer, const void *addr,
++				     uint32_t halStride)
++{
++	MappedFrameBuffer map(buffer, MappedFrameBuffer::MapFlag::Write);
++	if (!map.isValid()) {
++		LOG(Libcamhal, Error) << "Failed to map frame buffer";
++		return;
++	}
++
++	const auto &planes = map.planes();
++	const uint8_t *src = static_cast<const uint8_t *>(addr);
++	const unsigned int w = stream_.configuration().size.width;
++	const unsigned int h = stream_.configuration().size.height;
++	const unsigned int dstStride = stream_.configuration().stride;
++
++	/* Y plane */
++	uint8_t *dstY = planes[0].data();
++	for (unsigned int r = 0; r < h; r++)
++		memcpy(dstY + r * dstStride, src + r * halStride, w);
++
++	/* Interleaved UV plane (half height) */
++	const uint8_t *srcUV = src + (size_t)halStride * h;
++	uint8_t *dstUV = planes.size() >= 2 ? planes[1].data()
++					    : dstY + (size_t)dstStride * h;
++	for (unsigned int r = 0; r < h / 2; r++)
++		memcpy(dstUV + r * dstStride, srcUV + r * halStride, w);
++}
++
++void LibcamhalCameraData::run()
++{
++	while (running_) {
++		void *addr = nullptr, *cookie = nullptr;
++		uint32_t size = 0, stride = 0;
++		uint64_t ts = 0;
++
++		if (camhal_capture_wait(cap_, &addr, &size, &stride, &ts, &cookie) != 0) {
++			if (!running_)
++				break;
++			continue;
++		}
++
++		Request *request = nullptr;
++		{
++			std::lock_guard<std::mutex> lock(mutex_);
++			if (!pending_.empty()) {
++				request = pending_.front();
++				pending_.pop();
++			}
++		}
++
++		if (!request) {
++			/* No waiter: drop the frame, return the HAL buffer. */
++			camhal_capture_requeue(cap_, cookie);
++			continue;
++		}
++
++		FrameBuffer *buffer = request->findBuffer(&stream_);
++		if (!buffer) {
++			/* Should never happen for our single stream. */
++			LOG(Libcamhal, Error) << "Request has no buffer for stream";
++			camhal_capture_requeue(cap_, cookie);
++			continue;
++		}
++
++		fillBuffer(buffer, addr, stride ? stride : halStride_);
++
++		FrameMetadata &fmd = buffer->_d()->metadata();
++		fmd.status = FrameMetadata::Status::FrameSuccess;
++		fmd.sequence = seq_++;
++		fmd.timestamp = ts;
++		Span<const FrameBuffer::Plane> bufPlanes = buffer->planes();
++		for (const auto [i, p] : utils::enumerate(bufPlanes))
++			fmd.planes()[i].bytesused = p.length;
++
++		request->_d()->metadata().set(controls::SensorTimestamp, ts);
++
++		camhal_capture_requeue(cap_, cookie);
++
++		bufferCompleted.emit(buffer);
++	}
++}
++
++REGISTER_PIPELINE_HANDLER(PipelineHandlerLibcamhal, "libcamhal")
++
++} /* namespace libcamera */
+diff --git a/src/libcamera/pipeline/libcamhal/meson.build b/src/libcamera/pipeline/libcamhal/meson.build
+new file mode 100644
+index 0000000..79c0538
+--- /dev/null
++++ b/src/libcamera/pipeline/libcamhal/meson.build
+@@ -0,0 +1,14 @@
++# SPDX-License-Identifier: CC0-1.0
++
++libcamera_internal_sources += files([
++    'camhal_wrapper.cpp',
++    'libcamhal.cpp',
++])
++
++# libcamhal provides the Intel IPU camera HAL. We use its headers only and
++# dlopen() the library at runtime with RTLD_LOCAL (see camhal_wrapper.cpp), so
++# take a headers/compile-args-only dependency and do NOT link it. dlopen lives
++# in libc on modern glibc; link -ldl where it is a separate library.
++libcamhal_dep = dependency('libcamhal', required : true)
++libcamera_deps += libcamhal_dep.partial_dependency(compile_args : true, includes : true)
++libcamera_deps += cxx.find_library('dl', required : false)
+diff --git a/src/libcamera/pipeline/simple/simple.cpp b/src/libcamera/pipeline/simple/simple.cpp
+index c6fe12d..273ee47 100644
+--- a/src/libcamera/pipeline/simple/simple.cpp
++++ b/src/libcamera/pipeline/simple/simple.cpp
+@@ -48,6 +48,10 @@
+ #include "libcamera/internal/v4l2_subdevice.h"
+ #include "libcamera/internal/v4l2_videodevice.h"
+ 
++#ifdef HAVE_PIPELINE_LIBCAMHAL
++#include "pipeline/libcamhal/camhal_wrapper.h"
++#endif
++
+ namespace libcamera {
+ 
+ LOG_DEFINE_CATEGORY(SimplePipeline)
+@@ -2015,6 +2019,24 @@ bool SimplePipelineHandler::match(DeviceEnumerator *enumerator)
+ 	std::shared_ptr<MediaDevice> media;
+ 
+ 	for (const SimplePipelineInfo &inf : supportedDevices) {
++#ifdef HAVE_PIPELINE_LIBCAMHAL
++		/*
++		 * Yield Intel IPU devices to the libcamhal pipeline handler when
++		 * the HAL is present and reports a camera, so the IPU camera is
++		 * exposed only through libcamhal (full Intel imaging) and the
++		 * software-ISP duplicate does not appear. If libcamhal is not
++		 * usable, fall through and handle the device with the software
++		 * ISP exactly as before.
++		 */
++		if ((!strcmp(inf.driver, "intel-ipu6") ||
++		     !strcmp(inf.driver, "intel-ipu7")) &&
++		    camhal_available()) {
++			LOG(SimplePipeline, Info)
++				<< "Yielding " << inf.driver
++				<< " to the libcamhal pipeline handler";
++			continue;
++		}
++#endif
+ 		DeviceMatch dm(inf.driver);
+ 		while ((media = acquireMediaDevice(enumerator, dm))) {
+ 			/*

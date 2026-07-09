@@ -1,6 +1,7 @@
 Name:    libcamera
+Epoch:   1
 Version: 0.7.1
-Release: 6%{?dist}
+Release: 7%{?dist}
 Summary: A library to support complex camera ISPs
 # see .reuse/dep5 and COPYING for details
 License: LGPL-2.1-or-later
@@ -12,11 +13,22 @@ Source2: qcam.metainfo.xml
 Source3: 70-libcamera.rules
 
 Patch01: 0001-disable-rpi-pisp.patch
+# Expose Intel IPU cameras through the proprietary libcamhal HAL (full Intel
+# imaging) instead of the software ISP. See the patch header for details.
+# The default "auto" pipeline set now includes the "libcamhal" handler.
+# At runtime "simple" detects libcamhal and yields Intel IPU devices to it, so
+# the IPU camera is exposed only through the HAL (full Intel imaging) while the
+# software-ISP path stays available for everything else.
+Patch02: 0002-add-libcamhal-pipeline-handler.patch
 
 # libcamera does not currently build on these architectures
 ExcludeArch: s390x ppc64le
 
 BuildRequires: gcc-c++
+# Headers for the libcamhal pipeline handler
+%ifarch x86_64
+BuildRequires: libcamhal-devel
+%endif
 BuildRequires: gtest-devel
 BuildRequires: desktop-file-utils
 BuildRequires: meson
@@ -48,6 +60,12 @@ BuildRequires: SDL2-devel
 BuildRequires: systemd-devel
 # libcamera is not really usable without its IPA plugins
 Recommends: %{name}-ipa%{?_isa}
+# The libcamhal pipeline handler dlopen()s this at runtime; it is also used by
+# the "simple" handler to detect the HAL and yield Intel IPU devices to it.
+%ifarch x86_64
+Requires: libcamhal
+%endif
+
 Obsoletes: libcamera-doc < 0.6.0
 
 %description
@@ -61,7 +79,7 @@ complex ISPs (Image Signal Processor).
 
 %package     devel
 Summary:     Development package for %{name}
-Requires:    %{name}%{?_isa} = %{version}-%{release}
+Requires:    %{name}%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 
 %description devel
 Files for development with %{name}.
@@ -69,7 +87,7 @@ Files for development with %{name}.
 %package     ipa
 Summary:     ISP Image Processing Algorithm Plugins for %{name}
 License:     LGPL-2.1-or-later AND BSD-2-Clause
-Requires:    %{name}%{?_isa} = %{version}-%{release}
+Requires:    %{name}%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 
 %description ipa
 Image Processing Algorithms plugins for interfacing with device
@@ -78,7 +96,7 @@ ISPs for %{name}
 %package     tools
 Summary:     Tools for %{name}
 License:     LGPL-2.1-or-later AND BSD-3-Clause
-Requires:    %{name}%{?_isa} = %{version}-%{release}
+Requires:    %{name}%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 
 %description tools
 Command line tools for %{name}
@@ -86,28 +104,28 @@ Command line tools for %{name}
 %package     qcam
 Summary:     Graphical QCam application for %{name}
 License:     GPL-2.0-or-later AND MIT
-Requires:    %{name}%{?_isa} = %{version}-%{release}
+Requires:    %{name}%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 
 %description qcam
 Graphical QCam application for %{name}
 
 %package     gstreamer
 Summary:     GSTreamer plugin for %{name}
-Requires:    %{name}%{?_isa} = %{version}-%{release}
+Requires:    %{name}%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 
 %description gstreamer
 GSTreamer plugins for %{name}
 
 %package     v4l2
 Summary:     V4L2 compatibility layer for %{name}
-Requires:    %{name}%{?_isa} = %{version}-%{release}
+Requires:    %{name}%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 
 %description v4l2
 V4L2 compatibility layer for %{name}
 
 %package     -n python3-%{name}
 Summary:     Python bindings for %{name}
-Requires:    %{name}%{?_isa} = %{version}-%{release}
+Requires:    %{name}%{?_isa} = %{?epoch:%{epoch}:}%{version}-%{release}
 
 %description -n python3-%{name}
 Python bindings for %{name}
@@ -197,6 +215,13 @@ install -D -m 644 %SOURCE3 %{buildroot}/%{_udevrulesdir}/
 %{python3_sitearch}/*
 
 %changelog
+* Thu Jul 09 2026 negativo17 <build@negativo17.org> - 1:0.7.1-7
+- Add libcamhal pipeline handler for Intel IPU (IPU6/IPU7/IPU8) cameras.
+- Have the "simple" software-ISP handler detect libcamhal at runtime and yield
+  Intel IPU devices to the HAL, so the IPU camera is exposed only through
+  libcamhal (full Intel imaging) with no software-ISP duplicate.
+- Bump Epoch to 1.
+
 * Fri Jun 12 2026 Yaakov Selkowitz <yselkowi@redhat.com> - 0.7.1-6
 - Rebuilt for openssl 4.0
 
