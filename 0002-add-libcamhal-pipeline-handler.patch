@@ -522,10 +522,10 @@ index 0000000..252abfa
 +#endif
 diff --git a/src/libcamera/pipeline/libcamhal/libcamhal.cpp b/src/libcamera/pipeline/libcamhal/libcamhal.cpp
 new file mode 100644
-index 0000000..3df48e6
+index 0000000..692487f
 --- /dev/null
 +++ b/src/libcamera/pipeline/libcamhal/libcamhal.cpp
-@@ -0,0 +1,491 @@
+@@ -0,0 +1,510 @@
 +/* SPDX-License-Identifier: LGPL-2.1-or-later */
 +/*
 + * Copyright (C) 2026
@@ -603,10 +603,22 @@ index 0000000..3df48e6
 +
 +		properties_.set(properties::PixelArrayActiveAreas,
 +				{ Rectangle(maxSize_) });
-+		properties_.set(properties::Location,
-+				info.facing == 1 ? properties::CameraLocationFront
-+						 : properties::CameraLocationBack);
-+		properties_.set(properties::Model, std::string(info.name));
++
++		/*
++		 * The HAL's facing field is unreliable (icamerasrc ignores it and
++		 * it reports 0 even for user-facing sensors). Intel encodes the
++		 * mount in the sensor name instead: "-uf" = user facing (front),
++		 * "-wf" = world facing (back). Fall back to front, since a
++		 * built-in IPU sensor without a suffix is almost always the
++		 * user-facing laptop camera.
++		 */
++		std::string name(info.name);
++		int location = properties::CameraLocationFront;
++		if (name.find("-wf") != std::string::npos ||
++		    name.find("_wf") != std::string::npos)
++			location = properties::CameraLocationBack;
++		properties_.set(properties::Location, location);
++		properties_.set(properties::Model, name);
 +	}
 +
 +	/* Capture-thread entry point (overrides Thread::run()). */
@@ -846,12 +858,19 @@ index 0000000..3df48e6
 +	camhal_capture_close(data->cap_);
 +	data->cap_ = nullptr;
 +
-+	/* Cancel any requests that never received a frame. */
-+	std::lock_guard<std::mutex> lock(data->mutex_);
-+	while (!data->pending_.empty()) {
-+		cancelRequest(data->pending_.front());
-+		data->pending_.pop();
++	/*
++	 * Drop our internal queue, then cancel every request libcamera still
++	 * considers queued. This must include in-flight requests already popped
++	 * from pending_ but not yet completed -- libcamera asserts in stop()
++	 * that queuedRequests_ is empty, so cancelling only our own pending_
++	 * (which excludes in-flight requests) leaves stragglers and aborts.
++	 */
++	{
++		std::lock_guard<std::mutex> lock(data->mutex_);
++		std::queue<Request *>().swap(data->pending_);
 +	}
++	while (!data->queuedRequests_.empty())
++		cancelRequest(data->queuedRequests_.front());
 +}
 +
 +int PipelineHandlerLibcamhal::queueRequestDevice([[maybe_unused]] Camera *camera,

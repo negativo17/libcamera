@@ -1,7 +1,7 @@
 Name:    libcamera
 Epoch:   1
 Version: 0.7.1
-Release: 7%{?dist}
+Release: 8%{?dist}
 Summary: A library to support complex camera ISPs
 # see .reuse/dep5 and COPYING for details
 License: LGPL-2.1-or-later
@@ -215,6 +215,9 @@ install -D -m 644 %SOURCE3 %{buildroot}/%{_udevrulesdir}/
 %{python3_sitearch}/*
 
 %changelog
+* Tue Jul 14 2026 Simone Caronni <negativo17@gmail.com> - 1:0.7.1-8
+- Map front/back camera correctly from camhal information.
+
 * Thu Jul 09 2026 negativo17 <build@negativo17.org> - 1:0.7.1-7
 - Add libcamhal pipeline handler for Intel IPU (IPU6/IPU7/IPU8) cameras.
 - Have the "simple" software-ISP handler detect libcamhal at runtime and yield
